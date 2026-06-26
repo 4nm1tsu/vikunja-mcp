@@ -1,0 +1,314 @@
+/**
+ * Production-Ready Retry with Opossum Circuit Breaker
+ * Replaces 374-line custom implementation with battle-tested patterns
+ */
+
+import CircuitBreaker from 'opossum';
+import { logger } from './logger';
+import { isAuthenticationError } from './auth-error-handler';
+
+/**
+ * Simple circuit breaker registry for tracking and managing circuit breakers
+ */
+class CircuitBreakerRegistry {
+  private breakers = new Map<string, CircuitBreaker>();
+
+  register(name: string, breaker: CircuitBreaker): void {
+    this.breakers.set(name, breaker);
+  }
+
+  get(name: string): CircuitBreaker | undefined {
+    return this.breakers.get(name);
+  }
+
+  async resetAll(): Promise<void> {
+    const promises = Array.from(this.breakers.values()).map(breaker => {
+      return new Promise<void>((resolve) => {
+        if (breaker.opened) {
+          breaker.close();
+        }
+        resolve();
+      });
+    });
+    await Promise.all(promises);
+  }
+
+  getAllStats(): Record<string, unknown> {
+    const stats: Record<string, unknown> = {};
+    for (const [name, breaker] of this.breakers.entries()) {
+      stats[name] = breaker.stats;
+    }
+    return stats;
+  }
+
+  getAllStatsSync(): Record<string, unknown> {
+    return this.getAllStats();
+  }
+}
+
+export const circuitBreakerRegistry = new CircuitBreakerRegistry();
+
+/**
+ * Interface for errors that have code properties (like Node.js system errors)
+ */
+interface ErrorWithCode extends Error {
+  code?: string;
+  status?: number;
+}
+
+/**
+ * Simple retry configuration using opossum's built-in capabilities
+ */
+export interface RetryOptions {
+  maxRetries?: number;
+  timeout?: number;
+  resetTimeout?: number;
+  errorThresholdPercentage?: number;
+  volumeThreshold?: number;
+  shouldRetry?: (error: Error | ErrorWithCode) => boolean;
+  initialDelay?: number;
+  backoffFactor?: number;
+  maxDelay?: number;
+}
+
+// Production-ready defaults
+const DEFAULT_OPTIONS: Required<Omit<RetryOptions, 'shouldRetry'>> = {
+  maxRetries: 3,
+  timeout: 30000,
+  resetTimeout: 30000,
+  errorThresholdPercentage: 50,
+  volumeThreshold: 5,
+  initialDelay: 1000,
+  backoffFactor: 2,
+  maxDelay: 30000
+};
+
+/**
+ * Simple circuit breaker factory using opossum directly
+ */
+export function createCircuitBreaker<T>(
+  operation: () => Promise<T>,
+  name: string,
+  options: RetryOptions = {}
+): CircuitBreaker {
+  // Check if a circuit breaker with this name already exists
+  const existingBreaker = circuitBreakerRegistry.get(name);
+  if (existingBreaker) {
+    return existingBreaker;
+  }
+
+  const opts = { ...DEFAULT_OPTIONS, ...options };
+
+  const breaker = new CircuitBreaker(operation, {
+    timeout: opts.timeout,
+    resetTimeout: opts.resetTimeout,
+    errorThresholdPercentage: opts.errorThresholdPercentage,
+    volumeThreshold: opts.volumeThreshold
+  });
+
+  // Register with the global registry
+  circuitBreakerRegistry.register(name, breaker);
+
+  // Essential logging only
+  breaker.on('open', () => logger.warn(`Circuit breaker ${name} opened`));
+  breaker.on('close', () => logger.info(`Circuit breaker ${name} closed`));
+
+  return breaker;
+}
+
+/**
+ * Execute operation with automatic retry and circuit breaking
+ */
+export async function withRetry<T>(
+  operation: () => Promise<T>,
+  options: RetryOptions = {}
+): Promise<T> {
+  const opts = { ...DEFAULT_OPTIONS, ...options };
+  let lastError: unknown;
+  let delay = opts.initialDelay || 1000;
+
+  for (let attempt = 0; attempt <= (opts.maxRetries || 3); attempt++) {
+    try {
+      // Use circuit breaker for the operation
+      const breaker = createCircuitBreaker(operation, 'anonymous', opts);
+      return await breaker.fire() as Promise<T>;
+    } catch (error) {
+      lastError = error;
+
+      // Check if we should retry this error
+      const shouldRetry = opts.shouldRetry
+        ? opts.shouldRetry(error as Error)
+        : isRetryableError(error as Error);
+
+      // If this is the last attempt or error is not retryable, throw
+      if (attempt === (opts.maxRetries || 3) || !shouldRetry) {
+        throw error;
+      }
+
+      // Log retry attempt
+      logger.debug(`Retry attempt ${attempt + 1}/${opts.maxRetries || 3} after ${delay}ms`);
+
+      // Wait before retrying with exponential backoff
+      await new Promise(resolve => setTimeout(resolve, delay));
+      delay = Math.min(delay * (opts.backoffFactor || 2), opts.maxDelay || 30000);
+    }
+  }
+
+  throw lastError;
+}
+
+/**
+ * Execute operation with named circuit breaker for stats
+ */
+export async function withNamedRetry<T>(
+  operation: () => Promise<T>,
+  name: string,
+  options: RetryOptions = {}
+): Promise<T> {
+  const breaker = createCircuitBreaker(operation, name, options);
+  return breaker.fire() as Promise<T>;
+}
+
+/**
+ * Alias for withNamedRetry for backward compatibility
+ */
+export const withCircuitBreaker = withNamedRetry;
+
+/**
+ * Get circuit breaker health stats
+ */
+export function getHealthStats(breaker: CircuitBreaker): CircuitBreaker.Stats {
+  return breaker.stats;
+}
+
+/**
+ * Check if error is retryable (basic implementation)
+ */
+export function isRetryableError(error: unknown): error is ErrorWithCode {
+  if (error instanceof Error) {
+    // Authentication errors are retryable
+    if (isAuthenticationError(error)) {
+      return true;
+    }
+
+    const message = error.message.toLowerCase();
+    return message.includes('timeout') ||
+           message.includes('connection') ||
+           message.includes('network') ||
+           message.includes('rate limit') ||
+           (error as ErrorWithCode).code === 'ECONNRESET' ||
+           (error as ErrorWithCode).code === 'ETIMEDOUT';
+  }
+  return false;
+}
+
+/**
+ * Check if error is transient for circuit breaker purposes
+ */
+export function isTransientError(error: unknown): error is ErrorWithCode {
+  if (error instanceof Error) {
+    const message = error.message.toLowerCase();
+    return message.includes('timeout') ||
+           message.includes('timed out') ||
+           message.includes('connection') ||
+           message.includes('network') ||
+           message.includes('rate limit') ||
+           message.includes('socket') ||
+           message.includes('hang up') ||
+           message.includes('econnreset') ||
+           message.includes('etimedout') ||
+           message.includes('reset by peer') ||
+           message.includes('closed unexpectedly') ||
+           (error as ErrorWithCode).code === 'ECONNRESET' ||
+           (error as ErrorWithCode).code === 'ETIMEDOUT';
+  }
+  return false;
+}
+
+/**
+ * Predefined retry configurations for different operation types
+ */
+export const RETRY_CONFIG = {
+  AUTH_ERRORS: {
+    maxRetries: 3,
+    initialDelay: 1000,
+    maxDelay: 10000,
+    backoffFactor: 2,
+    enableCircuitBreaker: true,
+    circuitBreakerName: 'vikunja-auth-connect'
+  },
+  NETWORK_ERRORS: {
+    maxRetries: 5,
+    initialDelay: 500,
+    maxDelay: 30000,
+    backoffFactor: 1.5,
+    enableCircuitBreaker: true,
+    circuitBreakerName: 'vikunja-api-operations'
+  },
+  TASK_OPERATIONS: {
+    maxRetries: 3,
+    initialDelay: 1000,
+    maxDelay: 15000,
+    backoffFactor: 2,
+    enableCircuitBreaker: true,
+    circuitBreakerName: 'vikunja-task-create'
+  },
+  BULK_OPERATIONS: {
+    maxRetries: 2,
+    initialDelay: 2000,
+    maxDelay: 20000,
+    backoffFactor: 1.5,
+    enableCircuitBreaker: true,
+    circuitBreakerName: 'vikunja-bulk-operations'
+  }
+} as const;
+
+/**
+ * Circuit breaker name constants for consistent naming across the application
+ */
+export const CIRCUIT_BREAKER_NAMES = {
+  AUTH_CONNECT: 'vikunja-auth-connect',
+  AUTH_REFRESH: 'vikunja-auth-refresh',
+  AUTH_STATUS: 'vikunja-auth-status',
+  API_OPERATIONS: 'vikunja-api-operations',
+  CLIENT_OPERATIONS: 'vikunja-client-operations',
+  FILTER_OPERATIONS: 'vikunja-filter-operations',
+  TASK_CREATE: 'vikunja-task-create',
+  TASK_UPDATE: 'vikunja-task-update',
+  TASK_DELETE: 'vikunja-task-delete',
+  TASK_GET: 'vikunja-task-get',
+  TASK_LIST: 'vikunja-task-list',
+  TASK_RELATIONS: 'vikunja-task-relations',
+  TASK_ASSIGNEES: 'vikunja-task-assignees',
+  TASK_LABELS: 'vikunja-task-labels',
+  PROJECT_CRUD: 'vikunja-project-crud',
+  PROJECT_HIERARCHY: 'vikunja-project-hierarchy',
+  PROJECT_SHARING: 'vikunja-project-sharing',
+  BULK_OPERATIONS: 'vikunja-bulk-operations',
+  BULK_IMPORT: 'vikunja-bulk-import',
+  BULK_EXPORT: 'vikunja-bulk-export'
+} as const;
+
+/**
+ * Execute task operations with task-specific circuit breaker
+ */
+export async function withTaskRetry<T>(
+  operation: () => Promise<T>,
+  operationType: 'create' | 'update' | 'delete' | 'get',
+  options: RetryOptions = {}
+): Promise<T> {
+  const name = `vikunja-task-${operationType}`;
+  return withNamedRetry(operation, name, options);
+}
+
+/**
+ * Execute bulk operations with bulk-specific circuit breaker
+ */
+export async function withBulkRetry<T>(
+  operation: () => Promise<T>,
+  operationType: 'import' | 'export',
+  options: RetryOptions = {}
+): Promise<T> {
+  const name = `vikunja-bulk-${operationType}`;
+  return withNamedRetry(operation, name, options);
+}
