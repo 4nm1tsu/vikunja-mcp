@@ -24,12 +24,13 @@ export function registerTaskCommentsTool(
 ): void {
   server.tool(
     'vikunja_task_comments',
-    'Manage task comments: add comments to tasks',
+    'Manage task comments: add a comment, or list a task\'s comments',
     {
-      operation: z.enum(['comment']),
+      operation: z.enum(['comment', 'list']),
       // Task and comment identification
       id: z.number(),
-      comment: z.string(),
+      // Required for 'comment' (add); omitted for 'list' (read).
+      comment: z.string().optional(),
       commentId: z.number().optional(),
     },
     async (args) => {
@@ -51,7 +52,14 @@ export function registerTaskCommentsTool(
 
         switch (args.operation) {
           case 'comment':
-            return handleComment(args);
+            if (typeof args.comment !== 'string' || args.comment.length === 0) {
+              throw new MCPError(ErrorCode.VALIDATION_ERROR, 'comment text is required for the "comment" operation');
+            }
+            return handleComment({ id: args.id, comment: args.comment });
+
+          case 'list':
+            // No comment text -> handleComment fetches and lists the task's comments.
+            return handleComment({ id: args.id });
 
           default:
             throw new MCPError(
