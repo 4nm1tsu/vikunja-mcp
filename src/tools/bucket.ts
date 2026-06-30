@@ -68,6 +68,20 @@ function toItems(rows: unknown): Array<{ id: number; title: string }> {
   return (rows as NamedRow[]).map((r) => ({ id: r.id, title: r.title }));
 }
 
+// Like toItems, but also surfaces each bucket's TASKS. Vikunja's kanban /buckets endpoint embeds the
+// tasks per bucket; the plain toItems dropped them, leaving callers unable to see what's in a column
+// (e.g. which tasks are in "Ready"). Include id+title per task so the board is readable.
+function toBucketsWithTasks(
+  rows: unknown,
+): Array<{ id: number; title: string; tasks: Array<{ id: number; title: string }> }> {
+  if (!Array.isArray(rows)) return [];
+  return (rows as Array<NamedRow & { tasks?: unknown }>).map((r) => ({
+    id: r.id,
+    title: r.title,
+    tasks: toItems(r.tasks),
+  }));
+}
+
 /**
  * Register the kanban bucket tool.
  */
@@ -118,7 +132,7 @@ export function registerBucketTool(server: McpServer, authManager: AuthManager):
             return {
               content: formatMcpResponse(
                 createSuccessResponse('list-buckets', `Buckets for project ${args.projectId} view ${args.viewId}`, {
-                  items: toItems(buckets),
+                  items: toBucketsWithTasks(buckets),
                 }),
               ),
             };
