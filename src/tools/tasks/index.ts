@@ -279,10 +279,10 @@ export function registerTasksTool(
           case 'list-reminders':
             return listReminders(args as Parameters<typeof listReminders>[0]);
           case 'apply-label':
-            return applyLabels(args as Parameters<typeof applyLabels>[0]);
+            return applyLabels(authManager, args as Parameters<typeof applyLabels>[1]);
 
           case 'remove-label':
-            return removeLabels(args as Parameters<typeof removeLabels>[0]);
+            return removeLabels(authManager, args as Parameters<typeof removeLabels>[1]);
 
           case 'list-labels':
             return listTaskLabels(args as Parameters<typeof listTaskLabels>[0]);
