@@ -129,12 +129,23 @@ export function registerBucketTool(server: McpServer, authManager: AuthManager):
               'GET',
               `/projects/${args.projectId}/views/${args.viewId}/buckets`,
             );
+            const withTasks = toBucketsWithTasks(buckets);
+            // The success formatter renders items as id+title and DROPS the nested tasks. Build an
+            // explicit per-bucket task listing so a caller can actually see what's in each column.
+            const summary = withTasks
+              .map(
+                (b) =>
+                  `## ${b.title} (bucket ${b.id}) — ${b.tasks.length} task(s)\n` +
+                  (b.tasks.length ? b.tasks.map((t) => `  - #${t.id} ${t.title}`).join('\n') : '  (empty)'),
+              )
+              .join('\n');
+            const base = formatMcpResponse(
+              createSuccessResponse('list-buckets', `Buckets for project ${args.projectId} view ${args.viewId}`, {
+                items: withTasks,
+              }),
+            );
             return {
-              content: formatMcpResponse(
-                createSuccessResponse('list-buckets', `Buckets for project ${args.projectId} view ${args.viewId}`, {
-                  items: toBucketsWithTasks(buckets),
-                }),
-              ),
+              content: [{ type: 'text' as const, text: `${base[0]?.text ?? ''}\n\n${summary}` }],
             };
           }
 
