@@ -9,9 +9,14 @@
  *
  * Endpoints used:
  *   GET  /projects/{project}/views                              -> list views
- *   GET  /projects/{project}/views/{view}/buckets               -> list buckets (columns)
+ *   GET  /projects/{project}/views/{view}/tasks                 -> kanban board: buckets WITH tasks
  *   POST /projects/{project}/views/{view}/buckets/{bucket}/tasks -> move a task to a bucket
  *        body: { task_id, position? }
+ *
+ * NOTE: the /buckets endpoint returns columns but does NOT embed task membership (its `tasks`
+ * field is null and `count` is always 0). The kanban view's /tasks endpoint returns the SAME
+ * bucket objects but WITH each bucket's `tasks` array populated — that is the only reliable way
+ * to read what is in a column (e.g. which tasks are in "Ready").
  */
 
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
@@ -68,9 +73,10 @@ function toItems(rows: unknown): Array<{ id: number; title: string }> {
   return (rows as NamedRow[]).map((r) => ({ id: r.id, title: r.title }));
 }
 
-// Like toItems, but also surfaces each bucket's TASKS. Vikunja's kanban /buckets endpoint embeds the
-// tasks per bucket; the plain toItems dropped them, leaving callers unable to see what's in a column
-// (e.g. which tasks are in "Ready"). Include id+title per task so the board is readable.
+// Like toItems, but also surfaces each bucket's TASKS. The kanban view's /tasks endpoint returns
+// bucket objects each with a populated `tasks` array; the plain toItems dropped them, leaving callers
+// unable to see what's in a column (e.g. which tasks are in "Ready"). Include id+title per task so the
+// board is readable. Filter out done tasks' noise is left to the caller; we surface done as-is.
 function toBucketsWithTasks(
   rows: unknown,
 ): Array<{ id: number; title: string; tasks: Array<{ id: number; title: string }> }> {
@@ -124,10 +130,13 @@ export function registerBucketTool(server: McpServer, authManager: AuthManager):
             if (args.viewId === undefined) {
               throw new MCPError(ErrorCode.VALIDATION_ERROR, 'viewId is required for list-buckets');
             }
+            // Use the view's /tasks endpoint, NOT /buckets: only /tasks populates each bucket's
+            // `tasks` array (the /buckets endpoint returns null tasks + count 0), so this is the
+            // only reliable way to read column membership (e.g. what is in "Ready").
             const buckets = await vikunjaFetch(
               authManager,
               'GET',
-              `/projects/${args.projectId}/views/${args.viewId}/buckets`,
+              `/projects/${args.projectId}/views/${args.viewId}/tasks?per_page=250`,
             );
             const withTasks = toBucketsWithTasks(buckets);
             // The success formatter renders items as id+title and DROPS the nested tasks. Build an
