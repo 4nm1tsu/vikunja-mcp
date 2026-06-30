@@ -78,11 +78,18 @@ async function listTasks(
 
     logger.debug('Tasks tool response', { subcommand: 'list', itemCount: taskCount });
 
+    // The AORP markdown summary drops the task list (it showed only the count), making `list` nearly
+    // useless for discovery. Append a compact id+title line per task so callers can actually SEE which
+    // tasks exist (and look them up / move them).
+    const lines = (filteringResult.tasks || [])
+      .map((t: { id?: number; title?: string }) => `- #${t.id ?? '?'} ${t.title ?? ''}`)
+      .join('\n');
+
     return {
       content: [
         {
           type: 'text' as const,
-          text: formatAorpAsMarkdown(response.response),
+          text: `${formatAorpAsMarkdown(response.response)}${lines ? `\n\n${lines}` : ''}`,
         },
       ],
     };
